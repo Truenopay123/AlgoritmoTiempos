@@ -1,0 +1,296 @@
+@{
+    ViewData["Title"] = "Planificación";
+}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/frappe-gantt@0.6.1/dist/frappe-gantt.css" />
+<script src="https://cdn.jsdelivr.net/npm/frappe-gantt@0.6.1/dist/frappe-gantt.min.js"></script>
+<div class="container">
+    <h2>Planificación (preview)</h2>
+    <div class="d-flex gap-2 align-items-center mb-2">
+        <strong>Vista:</strong>
+        <button class="btn btn-sm btn-outline-primary" onclick="setView('Day')">Día</button>
+        <button class="btn btn-sm btn-outline-primary" onclick="setView('Week')">Semana</button>
+        <button class="btn btn-sm btn-outline-primary" onclick="setView('Month')">Mes</button>
+        <span class="ms-3"><strong>Zoom:</strong></span>
+        <input type="range" min="30" max="120" step="10" value="38" oninput="setZoom(this.value)" />
+    </div>
+    <div id="gantt"></div>
+    <hr/>
+    <h4>Ocupación por día</h4>
+    <div id="ocupacion"></div>
+    <hr/>
+    <h4>Ocupación por persona (heatmap)</h4>
+    <div id="heatmap"></div>
+    <hr/>
+    <h4>Edición rápida y confirmación de sobrepasos</h4>
+    <div id="editor"></div>
+    <div id="confirmacion"></div>
+</div>
+<script>
+    const state = {
+        personas: [],
+        actividades: [],
+        festivos: [],
+        preview: null,
+        gantt: null,
+        viewMode: 'Day',
+        columnWidth: 38,
+        rangoFechas: { inicio: null, fin: null },
+        ocupacionPorPersonaDia: {}, // { personaId: { dateKey: horas } }
+    };
+
+    const fmtDateKey = d => {
+        const nd = new Date(d);
+        nd.setHours(0,0,0,0);
+        return nd.toISOString();
+    };
+    const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
+    const isWeekend = d => { const day = new Date(d).getDay(); return day === 0 || day === 6; };
+    const isHoliday = d => {
+        const key = fmtDateKey(d);
+        return state.festivos.some(f => fmtDateKey(f) === key);
+    };
+    const isNonWorking = d => isWeekend(d) || isHoliday(d);
+
+    async function load() {
+        const res = await fetch('/Planning/MockData');
+        const data = await res.json();
+        state.personas = data.personas || [];
+        state.actividades = (data.actividades || []).map(a => ({
+            ...a,
+            inicio: new Date(a.inicio),
+            fin: new Date(a.fin)
+        }));
+        state.preview = data.preview || {};
+        // Intentamos extraer festivos si existen en la respuesta
+        state.festivos = (data.preview && data.preview.festivos) || data.festivos || [];
+        state.festivos = state.festivos.map(x => new Date(x));
+
+        calcularRango();
+        calcularOcupacionPorPersonaDia();
+        // Si no cargó la librería, mostramos mensaje y evitamos error
+        if (typeof Gantt === 'undefined') {
+            document.getElementById('gantt').innerHTML = '<div class="alert alert-warning">No se pudo cargar la librería de Gantt. Revisa la conexión o el CDN.</div>';
+        } else {
+            renderGantt();
+        }
+        // Ocupación simple por día (global)
+        const occ = (data.preview && data.preview.ocupacionPorDia) || {};
+        const occEl = document.getElementById('ocupacion');
+        const days = Object.keys(occ).sort();
+        let html = '<table class="table"><thead><tr><th>Día</th><th>Horas</th></tr></thead><tbody>';
+        for (const d of days) {
+            const h = occ[d];
+            let cls = h < 8 ? 'text-success' : (h === 8 ? 'text-warning' : 'text-danger');
+            html += `<tr><td>${new Date(d).toLocaleDateString()}</td><td class="${cls}">${h}</td></tr>`;
+        }
+        html += '</tbody></table>';
+        occEl.innerHTML = html;
+
+        renderHeatmap();
+        renderEditor();
+    }
+    function calcularRango(){
+        if (!state.actividades.length) return;
+        let min = state.actividades[0].inicio, max = state.actividades[0].fin;
+        for (const a of state.actividades){
+            if (a.inicio < min) min = a.inicio;
+            if (a.fin > max) max = a.fin;
+        }
+        state.rangoFechas = { inicio: new Date(min), fin: new Date(max) };
+    }
+    function calcularOcupacionPorPersonaDia(){
+        const map = {};
+        for (const p of state.personas) map[p.id] = {};
+        for (const a of state.actividades){
+            for (let d = new Date(a.inicio); d <= a.fin; d = addDays(d,1)){
+                if (isNonWorking(d)) continue; // no laborables fuera del cálculo
+                const k = fmtDateKey(d);
+                const pid = a.personalId || a.personal || a.personaId || a.asignadoA;
+                if (!pid) continue;
+                map[pid][k] = (map[pid][k] || 0) + (a.horasPorDia || 0);
+            }
+        }
+        state.ocupacionPorPersonaDia = map;
+    }
+    function tareasParaGantt(){
+        return state.actividades.map(a => ({
+            id: 'act-'+a.id,
+            name: `${a.nombre} (${a.horasPorDia||0}h/día)`,
+            start: a.inicio,
+            end: a.fin,
+            progress: 100,
+            custom_class: 'task-default',
+            personaId: a.personalId || a.personal || a.personaId || a.asignadoA,
+            horasPorDia: a.horasPorDia || 0
+        }));
+    }
+    function renderGantt(){
+        const tareas = tareasParaGantt();
+        state.gantt = new Gantt('#gantt', tareas, {
+            view_mode: state.viewMode,
+            column_width: state.columnWidth,
+            custom_popup_html: task => {
+                const persona = state.personas.find(p => p.id === task.personaId);
+                const nombre = persona ? persona.nombre : 'Sin asignación';
+                return `<div class="details-container">
+                    <div class="title">${task.name}</div>
+                    <div class="subtitle">${nombre}</div>
+                    <div class="content">${task.horasPorDia}h/día<br/>
+                    ${formatoSobrepaso(task)}</div>
+                </div>`;
+            }
+        });
+        sombrearNoLaborables();
+    }
+    function formatoSobrepaso(task){
+        const persona = state.personas.find(p => p.id === task.personaId);
+        if (!persona) return '';
+        // Cálculo aproximado: si task.horasPorDia > max, marcar
+        const over = (task.horasPorDia || 0) > (persona.maxHorasDiarias || 8);
+        return over ? '<span class="text-danger">Posible sobrecarga</span>' : '';
+    }
+    function sombrearNoLaborables(){
+        const g = state.gantt;
+        if (!g || typeof g.get_x !== 'function') return;
+        const svg = document.querySelector('#gantt svg');
+        if (!svg) return;
+        const height = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.height : svg.getBoundingClientRect().height;
+        const layer = svg.querySelector('.grid-layer') || svg; // fallback
+        // limpiar previos
+        svg.querySelectorAll('.nonwork-rect').forEach(r => r.remove());
+        for (let d = new Date(state.rangoFechas.inicio); d <= state.rangoFechas.fin; d = addDays(d,1)){
+            if (!isNonWorking(d)) continue;
+            const x = g.get_x(d);
+            const w = g.options.column_width;
+            const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+            rect.setAttribute('x', x);
+            rect.setAttribute('y', 0);
+            rect.setAttribute('width', w);
+            rect.setAttribute('height', height);
+            rect.setAttribute('class','nonwork-rect');
+            rect.setAttribute('fill','#f5c2c7');
+            rect.setAttribute('opacity','0.35');
+            layer.appendChild(rect);
+        }
+    }
+
+    function renderHeatmap(){
+        const cont = document.getElementById('heatmap');
+        const fechas = [];
+        for (let d = new Date(state.rangoFechas.inicio); d <= state.rangoFechas.fin; d = addDays(d,1)){
+            fechas.push(new Date(d));
+        }
+        let html = '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Persona</th>';
+        for (const d of fechas){
+            const mark = isNonWorking(d) ? ' class="bg-nonwork"' : '';
+            html += `<th${mark}>${d.toLocaleDateString()}</th>`;
+        }
+        html += '</tr></thead><tbody>';
+        for (const p of state.personas){
+            html += `<tr><td><strong>${p.nombre}</strong></td>`;
+            for (const d of fechas){
+                const k = fmtDateKey(d);
+                const horas = (state.ocupacionPorPersonaDia[p.id]||{})[k] || 0;
+                const pct = Math.round(100 * horas / (p.maxHorasDiarias||8));
+                const cls = pct < 100 ? 'cell-ok' : (pct === 100 ? 'cell-mid' : 'cell-high');
+                html += `<td class="${cls}${isNonWorking(d)?' bg-nonwork':''}" title="${horas}h (${pct}%)">${horas}</td>`;
+            }
+            html += '</tr>';
+        }
+        html += '</tbody></table></div>';
+        cont.innerHTML = html;
+    }
+
+    function renderEditor(){
+        const cont = document.getElementById('editor');
+        let html = '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Actividad</th><th>Persona</th><th>Inicio</th><th>Fin</th><th>Horas/día</th></tr></thead><tbody>';
+        for (let i=0;i<state.actividades.length;i++){
+            const a = state.actividades[i];
+            const persona = state.personas.find(p => p.id === (a.personalId||a.personal||a.personaId||a.asignadoA));
+            html += `<tr>
+                <td>${a.nombre}</td>
+                <td>${persona?persona.nombre:'-'}</td>
+                <td><input type="date" value="${a.inicio.toISOString().slice(0,10)}" onchange="editFecha(${i}, 'inicio', this.value)" /></td>
+                <td><input type="date" value="${a.fin.toISOString().slice(0,10)}" onchange="editFecha(${i}, 'fin', this.value)" /></td>
+                <td><input type="number" min="0" max="24" step="0.5" value="${a.horasPorDia||0}" onchange="editHoras(${i}, this.value)" /></td>
+            </tr>`;
+        }
+        html += '</tbody></table></div>';
+        html += '<button class="btn btn-danger" onclick="abrirConfirmacion()">Confirmar sobrepasos</button>';
+        cont.innerHTML = html;
+        document.getElementById('confirmacion').innerHTML = '';
+    }
+    function editFecha(idx, campo, val){
+        const a = state.actividades[idx];
+        a[campo] = new Date(val+'T00:00:00');
+        calcularRango();
+        calcularOcupacionPorPersonaDia();
+        if (state.gantt){ state.gantt.refresh(tareasParaGantt()); sombrearNoLaborables(); }
+        renderHeatmap();
+    }
+    function editHoras(idx, val){
+        const a = state.actividades[idx];
+        a.horasPorDia = parseFloat(val)||0;
+        calcularOcupacionPorPersonaDia();
+        if (state.gantt){ state.gantt.refresh(tareasParaGantt()); }
+        renderHeatmap();
+    }
+    function abrirConfirmacion(){
+        const sobrepasos = recolectarSobrepasos();
+        if (!sobrepasos.length){
+            document.getElementById('confirmacion').innerHTML = '<div class="alert alert-success mt-2">No hay sobrecargas. Todo OK.</div>';
+            return;
+        }
+        let html = '<div class="card mt-2"><div class="card-body"><h5>Sobrepasos detectados</h5><ul>';
+        for (let i=0;i<sobrepasos.length;i++){
+            const s = sobrepasos[i];
+            html += `<li><strong>${s.persona}</strong> ${new Date(s.fecha).toLocaleDateString()}: ${s.horas}h (${s.pct}%)<br/>
+                Motivo: <input type="text" class="form-control form-control-sm" id="motivo_${i}" placeholder="Justificación"/></li>`;
+        }
+        html += '</ul><button class="btn btn-primary" onclick="confirmarSobrepasos()">Confirmar</button></div></div>';
+        document.getElementById('confirmacion').innerHTML = html;
+    }
+    function recolectarSobrepasos(){
+        const res = [];
+        for (const p of state.personas){
+            const mapa = state.ocupacionPorPersonaDia[p.id] || {};
+            for (const k of Object.keys(mapa)){
+                const horas = mapa[k];
+                const pct = Math.round(100 * horas / (p.maxHorasDiarias||8));
+                if (pct > 100){
+                    res.push({ persona: p.nombre, personaId: p.id, fecha: k, horas, pct });
+                }
+            }
+        }
+        return res;
+    }
+    function confirmarSobrepasos(){
+        const sobrepasos = recolectarSobrepasos();
+        const payload = sobrepasos.map((s, i) => ({ ...s, motivo: document.getElementById('motivo_'+i)?.value || '' }));
+        console.log('Confirmación de sobrepasos:', payload);
+        document.getElementById('confirmacion').innerHTML = '<div class="alert alert-info mt-2">Sobrepasos confirmados localmente (pendiente de persistencia).</div>';
+    }
+    function setView(mode){
+        state.viewMode = mode;
+        if (state.gantt){ state.gantt.change_view_mode(mode); sombrearNoLaborables(); }
+    }
+    function setZoom(val){
+        state.columnWidth = parseInt(val,10);
+        if (state.gantt){
+            state.gantt.options.column_width = state.columnWidth;
+            state.gantt.refresh(tareasParaGantt());
+            sombrearNoLaborables();
+        }
+    }
+    load();
+</script>
+<style>
+    .text-success{ color: #198754; }
+    .text-warning{ color: #ffc107; }
+    .text-danger{ color: #dc3545; }
+    .bg-nonwork{ background: #fff3cd; }
+    .cell-ok{ background: #e9f7ef; }
+    .cell-mid{ background: #fff3cd; }
+    .cell-high{ background: #f8d7da; }
+    #gantt { min-height: 280px; }
+</style>
